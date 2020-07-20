@@ -44,6 +44,12 @@ void CalcBound(out bool2 bIsMinValid, out bool2 bIsMaxValid, out float2 vMin, ou
 
 #include "Packages/com.unity.render-pipelines.high-definition/Runtime/Lighting/LightLoop/LightingConvexHullUtils.hlsl"
 
+#ifdef Z_BINNING
+void ClipFace(uint f)
+{
+
+}
+#endif // Z_BINNING
 
 [numthreads(NR_THREADS, 1, 1)]
 void SCRAABBGEN(uint threadID : SV_GroupIndex, uint3 u3GroupID : SV_GroupID)
@@ -59,13 +65,143 @@ void SCRAABBGEN(uint threadID : SV_GroupIndex, uint3 u3GroupID : SV_GroupID)
     unsigned int g = groupID;
     unsigned int t = threadID;
 
-    const int subLigt = (int) (t/8);
-    const int lgtIndex = subLigt+(int) g*8;
-    const int sideIndex = (int) (t%8);
+    const int subLigt = (uint) (t/8);
+    const int lgtIndex = subLigt+(uint) g*8;
+    const int sideIndex = (uint) (t%8);
 
     const int eyeAdjustedLgtIndex = GenerateLightCullDataIndex(lgtIndex, g_iNrVisibLights, eyeIndex);
     SFiniteLightBound lgtDat = g_data[eyeAdjustedLgtIndex];
 
+#ifdef Z_BINNING
+    //**********************************************************************************************
+    // The goal of this program is to compute the AABB of the light in the NDC space ([0, 1] range).
+    // The light is represented by a convex hull with 6 faces (planar quads) and 8 vertices.
+    //
+    // Since a light may be partially off-screen, we must clip its hull before computing the AABB.
+    // Clipping the AABB (rather than the convex hull itself) may result in a rather loose AABB.
+    //
+    // To avoid having to deal with the toroidal properties of the perspective transform,
+    // we must perform clipping using the homogeneous (projective) post-perspective coordinates.
+    // This clipping method in described in Blinn's paper titled "Line Clipping".
+    //
+    // The algorithm processes a light on 4 threads. While all 6 faces may require clipping,
+    // clipping more than 4 faces is extremely uncommon (and, typically, it's either 0, 3 or 4).
+    // Note that certain faces may require culling rather than clipping (the former is simpler).
+    //
+    // Notation:
+    // pr - pre-perspective real (3D) coordinates
+    // pp - post-perspective projective (4D) coordinates
+    // *********************************************************************************************
+    #define NUM_EDGES   (12)
+    #define NUM_VERTS   (8)
+    #define NUM_FACES   (6)
+    #define NUM_PLANES  (6)
+    // All planes and faces are always in the standard order: -X, +X, -Y, +Y, -Z, +Z.
+    #define FACE_LEFT   (0x01) // x = -1
+    #define FACE_RIGHT  (0x02) // x = +1
+    #define FACE_FRONT  (0x04) // y = -1
+    #define FACE_BACK   (0x08) // y = +1
+    #define FACE_TOP    (0x0F) // z = -1
+    #define FACE_BOTTOM (0x10) // z = +1
+
+    static const uint facesOfVerts[NUM_VERTS] =
+    {
+        FACE_LEFT  | FACE_FRONT | FACE_TOP,    // (-1, -1, -1)
+        FACE_RIGHT | FACE_FRONT | FACE_TOP,    // (+1, -1, -1)
+        FACE_RIGHT | FACE_BACK  | FACE_TOP,    // (+1, +1, -1)
+        FACE_LEFT  | FACE_BACK  | FACE_TOP,    // (-1, +1, -1)
+        FACE_LEFT  | FACE_FRONT | FACE_BOTTOM, // (-1, -1, +1)
+        FACE_RIGHT | FACE_FRONT | FACE_BOTTOM, // (+1, -1, +1)
+        FACE_RIGHT | FACE_BACK  | FACE_BOTTOM, // (+1, +1, +1)
+        FACE_LEFT  | FACE_BACK  | FACE_BOTTOM  // (-1, +1, +1)
+    };
+
+    // Compute the convex hull.
+    // Due to linearity of matrix transforms, we can pre-transform individual components
+    // instead of post-transforming the vertices, thus saving 4 matrix multiplications.
+    // TODO: 2 points per thread.
+    float2 scale = lgtDat.scaleXY.xy;
+    float4 ppC   = mul(g_mProjection, float4(lgtDat.center.xyz,   1));
+    float4 ppX   = mul(g_mProjection, float4(lgtDat.boxAxisX.xyz, 0));
+    float4 ppY   = mul(g_mProjection, float4(lgtDat.boxAxisY.xyz, 0));
+    float4 ppZ   = mul(g_mProjection, float4(lgtDat.boxAxisZ.xyz, 0));
+
+    float4 ppVerts[NUM_VERTS]; // CCW order
+    ppVerts[0] = ppC - ppX * scale.x - ppY * scale.y - ppZ; // (-1, -1, -1)
+    ppVerts[1] = ppC + ppX * scale.x - ppY * scale.y - ppZ; // (+1, -1, -1)
+    ppVerts[2] = ppC + ppX * scale.x + ppY * scale.y - ppZ; // (+1, +1, -1)
+    ppVerts[3] = ppC - ppX * scale.x + ppY * scale.y - ppZ; // (-1, +1, -1)
+    ppVerts[4] = ppC - ppX           - ppY           + ppZ; // (-1, -1, +1)
+    ppVerts[5] = ppC + ppX           - ppY           + ppZ; // (+1, -1, +1)
+    ppVerts[6] = ppC + ppX           + ppY           + ppZ; // (+1, +1, +1)
+    ppVerts[7] = ppC - ppX           + ppY           + ppZ; // (-1, +1, +1)
+
+    for (uint i = 0; i < NUM_VERTS; i++)
+    {
+        // Make sure the W component is strictly positive.
+        // It is helpful in order to simplify clipping and avoid perspective division by 0.
+        float w = ppVerts[i].w;
+        float s = w >= 0 ? 1 : -1;
+
+        // Transform the X and Y components: [-w, w] -> [0, w].
+        ppVerts[i].x = (0.5 * s) * ppVerts[i].x + ((0.5 * s) * w);
+        ppVerts[i].y = (0.5 * s) * ppVerts[i].y + ((0.5 * s) * w);
+        ppVerts[i].z = s * ppVerts[i].z;
+        ppVerts[i].w = max(abs(w), FLT_MIN);
+    }
+
+    // For each vertex, we must determine whether it is within bounds.
+    // For clipping, we require per-frustum-plane in/out status.
+    uint vertOutsideFlags[NUM_VERTS]; // 6 bit each (HLSL does not support small data types)
+    ZERO_INITIALIZE_ARRAY(uint, vertOutsideFlags, NUM_VERTS); // Initially inside
+    uint allVertsOutsideFlags = 0;                            // Initially inside
+
+    for (uint i = 0; i < NUM_VERTS; i++)
+    {
+        // Consider the vertex to be inside the frustum if:
+        // 0 <= x <= w
+        // 0 <= y <= w
+        // 0 <= z <= w
+        float w = ppVerts[i].w;
+
+        for (uint j = 0; j < (NUM_PLANES / 2); j++)
+        {
+            vertOutsideFlags[i] |= (ppVerts[i][j] < 0 ? 1 : 0) << (2 * j + 0); // Planes crossing '0'
+            vertOutsideFlags[i] |= (ppVerts[i][j] > w ? 1 : 0) << (2 * j + 1); // Planes crossing 'w'
+        }
+
+        allVertsOutsideFlags |= vertOutsideFlags[i]; // Non-zero if any vertices are outside
+    }
+
+    if (allVertsOutsideFlags != 0) // Are any of the vertices outside?
+    {
+        // We must perform clipping or culling of faces.
+        uint facesToClipOrCull = 0;
+
+        for (uint i = 0; i < NUM_VERTS; i++)
+        {
+            uint faces = (vertOutsideFlags[i] == 0) ? 0 : facesOfVerts[i];
+            facesToClipOrCull |= faces;
+        }
+
+        uint numfacesToClipOrCull = countbits(facesToClipOrCull); // [1, 6]
+
+        uint f = 1;
+
+        while (numfacesToClipOrCull > 0)
+        {
+            if ((f & facesToClipOrCull) != 0)
+            {
+                /* TODO: only clip a single face per thread (6 threads per light). */
+                ClipFace(f);
+                numfacesToClipOrCull--;
+            }
+
+            f = f << 1;
+        }
+    }
+
+#else // !Z_BINNING
     const float3 boxX = lgtDat.boxAxisX.xyz;
     const float3 boxY = lgtDat.boxAxisY.xyz;
     const float3 boxZ = -lgtDat.boxAxisZ.xyz;           // flip axis (so it points away from the light direction for a spot-light)
@@ -390,6 +526,7 @@ void SCRAABBGEN(uint threadID : SV_GroupIndex, uint3 u3GroupID : SV_GroupID)
             g_vBoundsBuffer[boundsIndices.max] = float4(0.5*vMax.x + 0.5, 0.5*vMax.y + 0.5, vMax.z*VIEWPORT_SCALE_Z, linMaZ);
         }
     }
+#endif // Z_BINNING
 }
 
 
